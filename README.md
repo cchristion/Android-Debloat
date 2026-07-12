@@ -1,5 +1,12 @@
 # Android-Debloat
 
+### Init tools on ubuntu
+```bash
+sudo apt install adb fastboot
+adb start-server
+```
+
+
 ### Fetch all the packages from Android
 ```bash
 adb shell "(pm list packages -u)" | cut -s -f 2 -d ":" > phone.txt
