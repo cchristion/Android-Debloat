@@ -25,7 +25,7 @@ lists_path.mkdir(parents=True, exist_ok=True)
 
 for rec in recommendations:
     print(f"Writing: {rec}")
-    with open(lists_path / f"{rec}.txt", "w") as file:
+    with open(lists_path / f"{rec}.txt", "a") as file:
         for entry in content:
             if entry["removal"] == rec and entry["id"] in phone_packages:
                 file.write(f"{entry['id']}\n")
