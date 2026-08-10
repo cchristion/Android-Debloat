@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 
 
@@ -10,22 +11,30 @@ def cli():
     return args
 
 
-recommendations = ["Recommended", "Advanced", "Expert", "Unsafe"]
 args = cli()
+recommendations = ["Recommended", "Advanced", "Expert", "Unsafe"]
 
-with open(args.uad_list) as file:
-    content = file.read()
-content = eval(content)
+with Path.open(args.uad_list) as file:
+    uad_dict = json.load(file)
+    uad_packages = list(uad_dict.keys())
 
-with open(args.phone_list) as file:
+with Path.open(args.phone_list) as file:
     phone_packages = [line.strip() for line in file]
+
+common_packages = list(set(uad_packages) & set(phone_packages))
+
+to_file = {}
+
+for package in common_packages:
+    if uad_dict[package]["removal"] in to_file:
+        to_file[uad_dict[package]["removal"]].append(package)
+    else:
+        to_file[uad_dict[package]["removal"]] = [package]
 
 lists_path = Path("lists")
 lists_path.mkdir(parents=True, exist_ok=True)
 
-for rec in recommendations:
-    print(f"Writing: {rec}")
-    with open(lists_path / f"{rec}.txt", "a") as file:
-        for entry in content:
-            if entry["removal"] == rec and entry["id"] in phone_packages:
-                file.write(f"{entry['id']}\n")
+for key, value in to_file.items():
+    with Path.open(lists_path / f"{key}.txt", "a") as file:
+        file.writelines(f"{v}\n" for v in value)
+        print(f"Wrote {lists_path/key}.txt")
