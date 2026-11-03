@@ -1,33 +1,43 @@
 # Android-Debloat
 
-### Init tools on ubuntu
-```bash
+## TODO
+
+- Make everything a single script
+- Option to view what being purged
+
+## Init tools on ubuntu
+
+```shell
 sudo apt install adb fastboot
 adb start-server
 ```
 
+## Fetch all the packages from Android
 
-### Fetch all the packages from Android
-```bash
+```shell
 adb shell "(pm list packages -u)" | cut -s -f 2 -d ":" > phone.txt
 ```
 
-### Download the UAD lists
-```bash
-python download_uad.py
+## Download the UAD lists
+
+```shell
+uv run --with requests download_uad.py
 ```
 
-### Search against the new lists
-```bash
-python search.py -p phone.txt -u uad.json
+## Search against the new lists
+
+```shell
+uv run search.py -p phone.txt -u uad.json
 ```
 
-### Debloat using generated list
-```bash
-python debloat.py -l <list>
+## Debloat using generated list
+
+```shell
+uv run debloat.py -l <list>
 ```
 
-### Clean up
-```bash
+## Clean up
+
+```shell
 rm Advanced.txt Recommended.txt Unsafe.txt Expert.txt
 ```

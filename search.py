@@ -37,4 +37,4 @@ lists_path.mkdir(parents=True, exist_ok=True)
 for key, value in to_file.items():
     with Path.open(lists_path / f"{key}.txt", "a") as file:
         file.writelines(f"{v}\n" for v in value)
-        print(f"Wrote {lists_path/key}.txt")
+        print(f"Wrote {lists_path / key}.txt")
