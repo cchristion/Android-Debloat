@@ -30,6 +30,8 @@ class UAD:
             or Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "uad"
         )
         self.cache = base / "uad_lists.json"
+        self._rules: dict[str, dict] | None = None
+        self._installed: set[str] | None = None
 
     def adb(self, *args: str) -> tuple[bool, str]:
         cmd = ["adb", *(["-s", self.serial] if self.serial else []), *args]
@@ -37,6 +39,9 @@ class UAD:
         return res.returncode == 0, (res.stdout or res.stderr).strip()
 
     def rules(self, update: bool = False) -> dict[str, dict]:
+        if self._rules is not None and not update:
+            return self._rules
+
         if update or not self.cache.exists():
             log.info("Downloading UAD rules from GitHub...")
             self.cache.parent.mkdir(parents=True, exist_ok=True)
@@ -46,13 +51,18 @@ class UAD:
             tmp.write_bytes(raw)
             tmp.replace(self.cache)
             log.info("Saved %d rules to %s", len(data), self.cache)
+            self._rules = data
             return data
 
         data = json.loads(self.cache.read_text(encoding="utf-8"))
         log.info("Loaded %d cached rules from %s", len(data), self.cache)
+        self._rules = data
         return data
 
-    def installed(self) -> set[str]:
+    def installed(self, refresh: bool = False) -> set[str]:
+        if self._installed is not None and not refresh:
+            return self._installed
+
         target = f"device {self.serial}" if self.serial else "default ADB device"
         log.info("Querying installed packages on %s...", target)
         ok, out = self.adb("shell", "pm", "list", "packages", "--user", "0")
@@ -64,6 +74,7 @@ class UAD:
             if line.startswith("package:")
         }
         log.info("Found %d installed packages", len(pkgs))
+        self._installed = pkgs
         return pkgs
 
     def scan(
@@ -79,6 +90,23 @@ class UAD:
             for pkg in pkgs
             if pkg in data and data[pkg].get("removal") in allowed
         )
+        log.info("Matched %d packages", len(matches))
+        return matches
+
+    def search(self, query: str, update: bool = False) -> list[tuple[str, dict]]:
+        needle = query.strip().lower()
+        data = self.rules(update=update)
+        pkgs = self.installed()
+        log.info("Searching all installed Android packages for '%s'...", query.strip())
+        matches: list[tuple[str, dict]] = []
+        for pkg in sorted(pkgs):
+            meta = data.get(pkg) or {
+                "removal": "Unlisted",
+                "description": "Not in UAD database",
+            }
+            desc = meta.get("description", "")
+            if needle in pkg.lower() or needle in desc.lower():
+                matches.append((pkg, meta))
         log.info("Matched %d packages", len(matches))
         return matches
 
@@ -146,38 +174,68 @@ def parse_selection(raw: str, total: int) -> list[int]:
     return indices
 
 
-def run_cli(uad: UAD, targets: list[tuple[str, dict]]) -> None:
+def print_targets(targets: list[tuple[str, dict]]) -> None:
     print()
     for i, (pkg, meta) in enumerate(targets, start=1):
-        tier = meta.get("removal", "")
+        tier = meta.get("removal", "Unlisted")
         desc = " ".join(meta.get("description", "").split())
         print(f"[{i}] {pkg} [{tier}]")
         if desc:
             print(f"    {desc}")
 
-    try:
-        raw = input(
-            "\nSelect packages to debloat (e.g. 1,3-5 | all | Enter to cancel): "
-        )
-        selected_idx = parse_selection(raw, len(targets))
-    except (KeyboardInterrupt, EOFError):
-        print()
-        log.info("Cancelled by user")
-        return
-    except ValueError as exc:
-        log.error("Invalid selection: %s", exc)
-        return
 
-    if not selected_idx:
-        log.info("No packages selected")
-        return
+def run_cli(uad: UAD, targets: list[tuple[str, dict]], default_tiers: set[str]) -> None:
+    current = targets
+    print_targets(current)
 
-    total = len(selected_idx)
-    for pos, i in enumerate(selected_idx, start=1):
-        pkg = targets[i][0]
-        log.info("[%d/%d] Processing %s", pos, total, pkg)
-        uad.debloat(pkg)
-    log.info("Completed %d package(s)", total)
+    while True:
+        try:
+            raw = input(
+                "\nSelect (1,3-5 | all | /search | r=reset | Enter=cancel): "
+            ).strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            log.info("Cancelled by user")
+            return
+
+        if not raw:
+            log.info("No packages selected")
+            return
+
+        if raw.startswith("/"):
+            term = raw[1:].strip()
+            if not term:
+                log.warning("Enter a search term after '/'")
+                continue
+            found = uad.search(term)
+            if not found:
+                log.info("No installed packages match '%s'", term)
+                continue
+            current = found
+            print_targets(current)
+            continue
+
+        if raw.lower() == "r":
+            current = uad.scan(default_tiers)
+            if not current:
+                log.info("No packages match default tiers")
+                continue
+            print_targets(current)
+            continue
+
+        try:
+            selected_idx = parse_selection(raw, len(current))
+        except ValueError as exc:
+            log.error("Invalid selection: %s", exc)
+            continue
+
+        total = len(selected_idx)
+        for pos, i in enumerate(selected_idx, start=1):
+            pkg = current[i][0]
+            log.info("[%d/%d] Processing %s", pos, total, pkg)
+            uad.debloat(pkg)
+        log.info("Completed %d package(s)", total)
+        return
 
 
 def main() -> int:
@@ -195,11 +253,19 @@ def main() -> int:
         default=["Recommended"],
         help="Removal tiers (default: Recommended)",
     )
+    p.add_argument(
+        "--search", help="Search all installed Android packages by name or description"
+    )
     args = p.parse_args()
 
     uad = UAD(serial=args.serial)
+    default_tiers = set(args.tier)
     try:
-        targets = uad.scan(set(args.tier), update=args.update)
+        targets = (
+            uad.search(args.search, update=args.update)
+            if args.search
+            else uad.scan(default_tiers, update=args.update)
+        )
     except (RuntimeError, urllib.error.URLError, json.JSONDecodeError) as exc:
         log.error("%s", exc)
         return 1
@@ -208,7 +274,7 @@ def main() -> int:
         log.info("No matching packages found")
         return 0
 
-    run_cli(uad, targets)
+    run_cli(uad, targets, default_tiers)
     return 0
 
 
