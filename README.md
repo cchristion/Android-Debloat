@@ -7,7 +7,7 @@ sudo apt install adb fastboot
 adb start-server
 ```
 
-### New Way
+### New Way, using AI
 
 ```shell
 uv run --script uad.py --tier Recommended --tier Advanced --tier Expert
