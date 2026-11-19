@@ -5,129 +5,210 @@
 # ///
 
 import argparse
-import html
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
+import logging
 import os
 from pathlib import Path
 import subprocess
 import sys
-import threading
-from urllib.parse import parse_qs
+import urllib.error
 import urllib.request
-import webbrowser
 
 URL = "https://raw.githubusercontent.com/Universal-Debloater-Alliance/universal-android-debloater-next-generation/refs/heads/main/resources/assets/uad_lists.json"
 TIERS = ("Recommended", "Advanced", "Expert", "Unsafe")
 
+log = logging.getLogger("uad")
+
 
 class UAD:
-    def __init__(self, serial: str | None = None, cache_dir: Path | None = None, mock: bool = False) -> None:
+    def __init__(
+        self, serial: str | None = None, cache_dir: Path | None = None
+    ) -> None:
         self.serial = serial
-        self.mock = mock
-        base = cache_dir or Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "uad"
+        base = (
+            cache_dir
+            or Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "uad"
+        )
         self.cache = base / "uad_lists.json"
 
     def adb(self, *args: str) -> tuple[bool, str]:
-        if self.mock:
-            return True, "Success [MOCK]"
         cmd = ["adb", *(["-s", self.serial] if self.serial else []), *args]
         res = subprocess.run(cmd, capture_output=True, text=True, check=False)
         return res.returncode == 0, (res.stdout or res.stderr).strip()
 
     def rules(self, update: bool = False) -> dict[str, dict]:
         if update or not self.cache.exists():
+            log.info("Downloading UAD rules from GitHub...")
             self.cache.parent.mkdir(parents=True, exist_ok=True)
             raw = urllib.request.urlopen(URL, timeout=30).read()
-            json.loads(raw)
+            data = json.loads(raw)
             tmp = self.cache.with_suffix(".tmp")
             tmp.write_bytes(raw)
             tmp.replace(self.cache)
-        return json.loads(self.cache.read_text(encoding="utf-8"))
+            log.info("Saved %d rules to %s", len(data), self.cache)
+            return data
 
-    def installed(self, data: dict[str, dict] | None = None) -> set[str]:
-        if self.mock:
-            return set(list((data or self.rules()).keys())[:50])
+        data = json.loads(self.cache.read_text(encoding="utf-8"))
+        log.info("Loaded %d cached rules from %s", len(data), self.cache)
+        return data
+
+    def installed(self) -> set[str]:
+        target = f"device {self.serial}" if self.serial else "default ADB device"
+        log.info("Querying installed packages on %s...", target)
         ok, out = self.adb("shell", "pm", "list", "packages", "--user", "0")
         if not ok:
             raise RuntimeError(out or "ADB error")
-        return {line.removeprefix("package:").strip() for line in out.splitlines() if line.startswith("package:")}
+        pkgs = {
+            line.removeprefix("package:").strip()
+            for line in out.splitlines()
+            if line.startswith("package:")
+        }
+        log.info("Found %d installed packages", len(pkgs))
+        return pkgs
 
-    def scan(self, tiers: set[str] | None = None, update: bool = False) -> list[tuple[str, dict]]:
-        allowed = tiers or {"Recommended"}
+    def scan(
+        self, tiers: set[str] | None = None, update: bool = False
+    ) -> list[tuple[str, dict]]:
+        allowed = tiers if tiers is not None else {"Recommended"}
+        active = [t for t in TIERS if t in allowed]
         data = self.rules(update=update)
-        return sorted((pkg, data[pkg]) for pkg in self.installed(data) if pkg in data and data[pkg].get("removal") in allowed)
+        pkgs = self.installed()
+        log.info("Filtering packages for tiers: %s", ", ".join(active))
+        matches = sorted(
+            (pkg, data[pkg])
+            for pkg in pkgs
+            if pkg in data and data[pkg].get("removal") in allowed
+        )
+        log.info("Matched %d packages", len(matches))
+        return matches
 
-    def debloat(self, pkg: str) -> dict[str, str]:
+    def debloat(self, pkg: str) -> dict[str, tuple[bool, str]]:
+        log.info("Debloating %s", pkg)
         steps = {
             "clear": ("shell", "pm", "clear", pkg),
-            "bg1": ("shell", "cmd", "appops", "set", pkg, "RUN_IN_BACKGROUND", "ignore"),
-            "bg2": ("shell", "cmd", "appops", "set", pkg, "RUN_ANY_IN_BACKGROUND", "ignore"),
+            "bg1": (
+                "shell",
+                "cmd",
+                "appops",
+                "set",
+                pkg,
+                "RUN_IN_BACKGROUND",
+                "ignore",
+            ),
+            "bg2": (
+                "shell",
+                "cmd",
+                "appops",
+                "set",
+                pkg,
+                "RUN_ANY_IN_BACKGROUND",
+                "ignore",
+            ),
             "hide": ("shell", "pm", "hide", pkg),
             "uninstall": ("shell", "pm", "uninstall", "--user", "0", pkg),
         }
-        return {k: self.adb(*cmd)[1] for k, cmd in steps.items()}
+        results: dict[str, tuple[bool, str]] = {}
+        for name, cmd in steps.items():
+            ok, out = self.adb(*cmd)
+            results[name] = (ok, out)
+            status = "OK" if ok else "FAIL"
+            log.info("  [%s] %s: %s", status, name, out or "done")
+        return results
 
 
-def run_checklist(uad: UAD, targets: list[tuple[str, dict]]) -> None:
-    rows = "\n".join(
-        f'<div style="border-bottom:1px solid #ddd;padding:10px 0">'
-        f'<label><input type="checkbox" name="pkg" value="{html.escape(pkg)}"> '
-        f'<b>{html.escape(pkg)}</b> [{html.escape(meta.get("removal", ""))}]</label> '
-        f'<a href="https://play.google.com/store/apps/details?id={html.escape(pkg)}" target="_blank">Play Store</a>'
-        f'<p style="margin:4px 0 0 22px;color:#444">{html.escape(meta.get("description", ""))}</p></div>'
-        for pkg, meta in targets
-    )
-    page = (
-        f"<!doctype html><html><body style='font-family:sans-serif;max-width:860px;margin:20px auto'>"
-        f"<form method='POST'><button type='submit' style='padding:10px 16px;font-size:16px'>Uninstall Selected</button>"
-        f"{rows}</form></body></html>"
-    )
+def parse_selection(raw: str, total: int) -> list[int]:
+    token = raw.strip().lower()
+    if not token:
+        return []
+    if token == "all":
+        return list(range(total))
+    indices: list[int] = []
+    seen: set[int] = set()
+    for part in token.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            start, end = int(a), int(b)
+            if start < 1 or end > total or start > end:
+                raise ValueError(f"Range out of bounds: {part}")
+            items = range(start - 1, end)
+        else:
+            idx = int(part)
+            if idx < 1 or idx > total:
+                raise ValueError(f"Index out of bounds: {part}")
+            items = (idx - 1,)
+        for i in items:
+            if i not in seen:
+                seen.add(i)
+                indices.append(i)
+    return indices
 
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(page.encode("utf-8"))
 
-        def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length", 0))
-            selected = parse_qs(self.rfile.read(length).decode("utf-8")).get("pkg", [])
-            results = "\n".join(f"{pkg}: {uad.debloat(pkg)}" for pkg in selected) or "No packages selected."
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(results.encode("utf-8"))
-            threading.Thread(target=self.server.shutdown, daemon=True).start()
+def run_cli(uad: UAD, targets: list[tuple[str, dict]]) -> None:
+    print()
+    for i, (pkg, meta) in enumerate(targets, start=1):
+        tier = meta.get("removal", "")
+        desc = " ".join(meta.get("description", "").split())
+        print(f"[{i}] {pkg} [{tier}]")
+        if desc:
+            print(f"    {desc}")
 
-        def log_message(self, *args: object) -> None:
-            pass
-
-    srv = HTTPServer(("127.0.0.1", 0), Handler)
-    url = f"http://127.0.0.1:{srv.server_port}"
-    print(f"Checklist open: {url} (Ctrl+C to cancel)")
-    webbrowser.open(url)
     try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        raw = input(
+            "\nSelect packages to debloat (e.g. 1,3-5 | all | Enter to cancel): "
+        )
+        selected_idx = parse_selection(raw, len(targets))
+    except (KeyboardInterrupt, EOFError):
+        print()
+        log.info("Cancelled by user")
+        return
+    except ValueError as exc:
+        log.error("Invalid selection: %s", exc)
+        return
+
+    if not selected_idx:
+        log.info("No packages selected")
+        return
+
+    total = len(selected_idx)
+    for pos, i in enumerate(selected_idx, start=1):
+        pkg = targets[i][0]
+        log.info("[%d/%d] Processing %s", pos, total, pkg)
+        uad.debloat(pkg)
+    log.info("Completed %d package(s)", total)
 
 
 def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="[%(levelname)s] %(message)s", stream=sys.stdout
+    )
+
     p = argparse.ArgumentParser(prog="uad.py")
-    p.add_argument("-s", "--serial")
-    p.add_argument("--update", action="store_true")
-    p.add_argument("--tier", action="append", choices=TIERS)
-    p.add_argument("--mock", action="store_true", help="Test UI without an ADB device")
+    p.add_argument("-s", "--serial", help="ADB device serial")
+    p.add_argument("--update", action="store_true", help="Refresh cached UAD list")
+    p.add_argument(
+        "--tier",
+        nargs="+",
+        choices=TIERS,
+        default=["Recommended"],
+        help="Removal tiers (default: Recommended)",
+    )
     args = p.parse_args()
 
-    uad = UAD(serial=args.serial, mock=args.mock)
-    targets = uad.scan(set(args.tier or ["Recommended"]), update=args.update)
+    uad = UAD(serial=args.serial)
+    try:
+        targets = uad.scan(set(args.tier), update=args.update)
+    except (RuntimeError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        log.error("%s", exc)
+        return 1
+
     if not targets:
-        print("No matching packages.")
+        log.info("No matching packages found")
         return 0
-    run_checklist(uad, targets)
+
+    run_cli(uad, targets)
     return 0
 
 
